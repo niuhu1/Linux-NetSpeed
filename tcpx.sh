@@ -2815,15 +2815,24 @@ install_xanmod_generic() {
 	apt update
 	apt-get install gnupg gnupg2 gnupg1 wget -y
 
+	# 获取当前系统发行版代号 (如 bookworm, bullseye, jammy, noble 等)
+	local codename
+	codename=$(lsb_release -sc 2>/dev/null)
+	[[ -z "$codename" ]] && codename=$(grep -oP '(?<=VERSION_CODENAME=).*' /etc/os-release 2>/dev/null)
+	[[ -z "$codename" ]] && codename="${OS_VERSION_CODENAME:-}"
+	[[ -z "$codename" ]] && codename="bookworm"
+
 	# 清除可能存在的旧版或重复源 (兼容 PR 提到的 .sources 与冲突问题)
 	rm -f /etc/apt/sources.list.d/xanmod-kernel.list
 	rm -f /etc/apt/sources.list.d/xanmod-release.list
 	rm -f /etc/apt/sources.list.d/xanmod-kernel.sources
+	rm -f /etc/apt/sources.list.d/xanmod.list
 	sed -i '/deb.xanmod.org/d' /etc/apt/sources.list 2>/dev/null
 
-	# 使用现代化的 signed-by 格式写入 GPG 密钥与源，彻底消除 apt 警告
-	wget -qO - https://dl.xanmod.org/gpg.key | gpg --dearmor --yes -o /usr/share/keyrings/xanmod-archive-keyring.gpg
-	echo 'deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main' | tee /etc/apt/sources.list.d/xanmod-kernel.list
+	# 使用现代化的 signed-by 格式写入 GPG 密钥与源
+	mkdir -p /etc/apt/keyrings
+	wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor --yes -o /etc/apt/keyrings/xanmod-archive-keyring.gpg
+	echo "deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org ${codename} main" | tee /etc/apt/sources.list.d/xanmod-release.list
 
 	# 在临时目录下载并运行 CPU 支持等级检测脚本，避免污染调用方 CWD
 	local xanmod_work
@@ -2846,20 +2855,42 @@ install_xanmod_generic() {
 			grep -oE '\bv[1-4]\b' | tail -n 1 | tr -d 'v')
 		[[ -z "$cpu_level" ]] && cpu_level="1"
 	else
-		echo -e "${TIP} CPU 等级检测脚本下载失败，将使用 v1 (最兼容) 版本。"
+		# 本地根据 /proc/cpuinfo 指令集兜底识别，避免直接降级为最低等级
+		local cpu_flags
+		cpu_flags=$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null || true)
+		if echo "$cpu_flags" | grep -qw avx512f && echo "$cpu_flags" | grep -qw avx512bw; then
+			cpu_level="4"
+		elif echo "$cpu_flags" | grep -qw avx2 && echo "$cpu_flags" | grep -qw bmi2; then
+			cpu_level="3"
+		elif echo "$cpu_flags" | grep -qw cx16 && echo "$cpu_flags" | grep -qw sse4_2; then
+			cpu_level="2"
+		fi
+		echo -e "${TIP} CPU 等级检测脚本联网获取失败，已从本地 CPU 指令集自动识别为: v${cpu_level}"
 	fi
 	echo -e "${INFO} CPU 支持等级: \033[32mv${cpu_level}\033[0m"
 
-	apt update
+	if ! apt update; then
+		echo -e "${ERROR} XanMod 软件源更新失败，请检查网络连接！"
+		return 1
+	fi
+
 	local pkg_name="linux-xanmod"
 	[[ "$edition" != "main" ]] && pkg_name="linux-xanmod-${edition}"
 
-	if [[ "$cpu_level" -ge 3 ]]; then
-		apt install "${pkg_name}-x64v3" -y
+	local target_pkg="${pkg_name}-x64v1"
+	if [[ "$cpu_level" -ge 4 ]] && apt-cache show "${pkg_name}-x64v4" >/dev/null 2>&1; then
+		target_pkg="${pkg_name}-x64v4"
+	elif [[ "$cpu_level" -ge 3 ]]; then
+		target_pkg="${pkg_name}-x64v3"
 	elif [[ "$cpu_level" -ge 2 ]]; then
-		apt install "${pkg_name}-x64v2" -y
-	else
-		apt install "${pkg_name}-x64v1" -y
+		target_pkg="${pkg_name}-x64v2"
+	fi
+
+	echo -e "${INFO} 正在安装内核包: \033[32m${target_pkg}\033[0m ..."
+	if ! apt install "${target_pkg}" -y; then
+		echo -e "${ERROR} 内核包 ${target_pkg} 安装失败！"
+		echo -e "${TIP} 如报错与 DKMS (如 tcp-brutal/第三方驱动) 编译相关，可先执行 'dkms status' 并移除冲突模块后重试。"
+		return 1
 	fi
 
 	BBR_grub
